@@ -32,8 +32,8 @@ sudo reboot
 
 如果要使用 `nanami-vps-setup` ：
 
-```bash
-<(wget -qO- https://raw.githubusercontent.com/yayitinyu/nanami-vps-setup/main/nanami_setup.sh)
+```
+bash <(wget -qO- https://raw.githubusercontent.com/yayitinyu/nanami-vps-setup/main/nanami_setup.sh)
 ```
 
 ---
