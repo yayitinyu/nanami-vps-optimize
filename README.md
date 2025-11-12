@@ -43,5 +43,3 @@ sudo reboot
 ## 🩵 许可
 
 MIT License © [yayitinyu](https://github.com/yayitinyu)
-
-```
