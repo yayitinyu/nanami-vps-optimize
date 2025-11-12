@@ -22,6 +22,26 @@
 ```bash
 wget https://raw.githubusercontent.com/yayitinyu/nanami-vps-optimize/main/nanami_optimize_universal.sh -O nanami_optimize_universal.sh
 sudo bash nanami_optimize_universal.sh
+````
 
 运行完建议重启一次：
+
+```bash
 sudo reboot
+```
+
+---
+
+## 💬 说明
+
+* 默认配置轻量安全，可在 `/etc/sysctl.conf` 中微调
+* 适合内存 ≥ 1GB 的 VPS，低内存机型建议把 `swappiness` 改为 30
+* 如果使用 OpenVZ/LXC 架构，部分优化项（如 BBRx）可能无效
+
+---
+
+## 🩵 许可
+
+MIT License © [yayitinyu](https://github.com/yayitinyu)
+
+```
