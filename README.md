@@ -36,6 +36,12 @@ sudo reboot
 bash <(wget -qO- https://raw.githubusercontent.com/yayitinyu/nanami-vps-setup/main/nanami_setup.sh)
 ```
 
+如果要使用 `SSH 密钥生成` ：
+
+```
+wget -O key.sh https://raw.githubusercontent.com/yayitinyu/nanami-vps-optimize/refs/heads/main/key.sh && chmod +x key.sh && clear && ./key.sh
+```
+
 ---
 
 ## 💬 说明
