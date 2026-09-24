@@ -90,6 +90,8 @@ sudo bash nanami_optimize_universal.sh --uninstall
 
 `--github-hosts-update` 只更新一次，不开启定时任务。菜单 **10 → 3** 或 `--github-hosts-disable -y` 会移除定时任务和本脚本管理的区块；`--uninstall` 也会移除它们。自动更新记录在 `/var/log/nanami-optimize/github-hosts.log`。
 
+推送到 `main` 或提交 Pull Request 时，CI 会检查 Bash 语法并运行 Hosts 隔离测试。
+
 ---
 
 ## 推荐流程

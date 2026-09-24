@@ -1,0 +1,32 @@
+name: Shell CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Syntax and isolated tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check Bash syntax
+        shell: bash
+        run: |
+          bash -n key.sh
+          bash -n nanami_optimize_universal.sh
+          bash -n tests/test_github_hosts.sh
+
+      - name: Test GitHub Hosts updater
+        shell: bash
+        run: bash tests/test_github_hosts.sh
