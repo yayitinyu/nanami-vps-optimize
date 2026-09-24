@@ -25,8 +25,10 @@
 | 7 | SSH 密钥登录 | 生成 ed25519、写 `authorized_keys`（可选关密码） |
 | 8 | 查看状态 | 拥塞控制、缓冲、路由、SWAP 等 |
 | 9 | 卸载还原 | 移除本脚本写入的配置与服务 |
+| 10 | GitHub Hosts | 可选：立即更新并配置每日自动更新 |
 
 **一键全量故意不包含 SSH 改密/关密码**，避免误锁登录；需要时请单独选 **7** 或运行 `key.sh`。
+**GitHub Hosts 也不属于一键全量**，只有选择菜单 **10** 或使用专用参数时才会启用。
 
 ---
 
@@ -56,6 +58,11 @@ sudo bash nanami_optimize_universal.sh --all -y
 # 仅 BBR + 网络，指定带宽与跨洋地区
 sudo bash nanami_optimize_universal.sh --bbr --bandwidth 500 --region overseas -y
 
+# GitHub Hosts：启用每日更新、手动更新、停用
+sudo bash nanami_optimize_universal.sh --github-hosts
+sudo bash nanami_optimize_universal.sh --github-hosts-update
+sudo bash nanami_optimize_universal.sh --github-hosts-disable -y
+
 # 查看状态 / 卸载
 sudo bash nanami_optimize_universal.sh --status
 sudo bash nanami_optimize_universal.sh --uninstall
@@ -67,9 +74,21 @@ sudo bash nanami_optimize_universal.sh --uninstall
 | `--bbr` | 仅网络/BBR |
 | `--limits` / `--swap` / `--disk` / `--tools` / `--clean` / `--ssh-key` | 分项 |
 | `--status` / `--uninstall` | 状态 / 卸载 |
+| `--github-hosts` / `--github-hosts-update` / `--github-hosts-disable -y` | 启用每日更新 / 立即更新 / 停用并移除本脚本条目 |
+| `--github-hosts-status` | 仅查看 GitHub Hosts 状态 |
 | `-y` / `--yes` | 确认默认 yes |
 | `--bandwidth <Mbps>` | 带宽（配合 `--all` / `--bbr`） |
 | `--region asia\|overseas` | 亚太 / 美欧（影响缓冲大小） |
+
+---
+
+## GitHub Hosts（可选）
+
+选择菜单 **10 → 1** 或运行 `--github-hosts` 后，脚本从 [maxiaof/github-hosts](https://github.com/maxiaof/github-hosts) 的 [hosts 文件](https://raw.githubusercontent.com/maxiaof/github-hosts/master/hosts) 获取条目，立即更新一次，并在 `/etc/cron.d/nanami-github-hosts` 设置**每日 04:25（服务器本地时间）**自动更新。需要 `curl`、`cron` 和 `flock`；启用时会安装缺少的依赖并启动 cron 服务。
+
+脚本只维护 `/etc/hosts` 中 `# Nanami GitHub Hosts BEGIN` 与 `# Nanami GitHub Hosts END` 之间的内容；其他条目保留。下载失败或格式校验失败时不会改动 `/etc/hosts`；首次下载失败时定时任务仍会保留，之后按计划重试。首次更新前和每次改动前的备份保存在 `/etc/nanami-optimize/`。若 `/etc/hosts` 前面已有同域名的自定义映射，它们可能优先生效，请自行检查。
+
+`--github-hosts-update` 只更新一次，不开启定时任务。菜单 **10 → 3** 或 `--github-hosts-disable -y` 会移除定时任务和本脚本管理的区块；`--uninstall` 也会移除它们。自动更新记录在 `/var/log/nanami-optimize/github-hosts.log`。
 
 ---
 

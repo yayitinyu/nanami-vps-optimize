@@ -10,7 +10,7 @@
 
 set -Euo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="Nanami VPS Optimize"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-nanami-optimize.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-nanami.conf"
@@ -19,6 +19,10 @@ readonly MODULES_LOAD_FILE="/etc/modules-load.d/nanami-bbr.conf"
 readonly BOOT_APPLY_BIN="/usr/local/sbin/nanami-boot-apply"
 readonly BOOT_APPLY_UNIT="/etc/systemd/system/nanami-boot-apply.service"
 readonly CLEAN_SCRIPT="/usr/local/bin/nanami-clean.sh"
+readonly GITHUB_HOSTS_BIN="/usr/local/sbin/nanami-github-hosts"
+readonly GITHUB_HOSTS_CRON="/etc/cron.d/nanami-github-hosts"
+readonly GITHUB_HOSTS_BEGIN="# Nanami GitHub Hosts BEGIN"
+readonly GITHUB_HOSTS_END="# Nanami GitHub Hosts END"
 readonly LOG_DIR="/var/log/nanami-optimize"
 readonly STATE_DIR="/etc/nanami-optimize"
 readonly STATE_FILE="${STATE_DIR}/state.env"
@@ -980,6 +984,235 @@ EOF
 }
 
 #-----------------------------------------------------------------------------
+# 可选：GitHub Hosts（不参与一键优化）
+#-----------------------------------------------------------------------------
+install_github_hosts_helper() {
+    local tmp
+    tmp="$(mktemp "${GITHUB_HOSTS_BIN}.XXXXXX")"
+    cat > "$tmp" <<'GITHUB_HOSTS_HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly HOSTS_FILE=/etc/hosts
+readonly STATE_DIR=/etc/nanami-optimize
+readonly SOURCE_URL=https://raw.githubusercontent.com/maxiaof/github-hosts/master/hosts
+readonly BEGIN_MARKER='# Nanami GitHub Hosts BEGIN'
+readonly END_MARKER='# Nanami GitHub Hosts END'
+
+fail() { printf 'GitHub Hosts: %s\n' "$*" >&2; exit 1; }
+[[ "$(id -u)" -eq 0 ]] || fail '需要 root 权限'
+[[ -f "$HOSTS_FILE" && ! -L "$HOSTS_FILE" ]] || fail '/etc/hosts 不存在或是符号链接'
+command -v flock >/dev/null 2>&1 || fail '缺少 flock'
+
+mkdir -p -m 0700 "$STATE_DIR"
+exec 9>"${STATE_DIR}/github-hosts.lock"
+flock -w 60 9 || fail '等待更新锁超时'
+
+download=''
+entries=''
+next_hosts=''
+cleanup() {
+    [[ -z "$download" ]] || rm -f -- "$download"
+    [[ -z "$entries" ]] || rm -f -- "$entries"
+    [[ -z "$next_hosts" ]] || rm -f -- "$next_hosts"
+}
+trap cleanup EXIT
+
+case "${1:---update}" in
+    --update)
+        command -v curl >/dev/null 2>&1 || fail '缺少 curl'
+        download="$(mktemp)"
+        entries="$(mktemp)"
+        curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 45 --retry 2 \
+            --output "$download" "$SOURCE_URL" || fail '下载失败，原 Hosts 未修改'
+
+        # 仅接受上游的 GitHub 域名和合法 IPv4；错误页面或异常内容不写入系统文件。
+        awk '
+            function allowed(host) {
+                return host ~ /(^|[.])(github[.]com|githubusercontent[.]com|githubassets[.]com|github[.]io|github[.]blog|githubstatus[.]com|github[.]community|github[.]dev)$/ ||
+                    host == "github.map.fastly.net" ||
+                    host == "github.global.ssl.fastly.net" ||
+                    host ~ /^github(-[a-z0-9-]+)?[.]s3[.]amazonaws[.]com$/
+            }
+            {
+                sub(/\r$/, "")
+                if ($0 == "#Github Hosts Start") {
+                    if (inside || starts || ends) { bad = 1; exit }
+                    starts++; inside = 1; next
+                }
+                if ($0 == "#Github Hosts End") {
+                    if (!inside) { bad = 1; exit }
+                    ends++; inside = 0; next
+                }
+                if ($0 ~ /^[[:space:]]*($|#)/) next
+                if (!inside || NF != 2 || !allowed($2) || seen[$2]++) { bad = 1; exit }
+                if (split($1, octets, ".") != 4) { bad = 1; exit }
+                for (i = 1; i <= 4; i++) {
+                    if (octets[i] !~ /^[0-9]+$/ || length(octets[i]) > 3 ||
+                        (length(octets[i]) > 1 && octets[i] ~ /^0/) || octets[i] + 0 > 255) {
+                        bad = 1; exit
+                    }
+                }
+                if (octets[1] + 0 < 1 || octets[1] + 0 > 223 || octets[1] + 0 == 127 ||
+                    octets[1] + 0 == 10 ||
+                    (octets[1] + 0 == 172 && octets[2] + 0 >= 16 && octets[2] + 0 <= 31) ||
+                    (octets[1] + 0 == 192 && octets[2] + 0 == 168) ||
+                    (octets[1] + 0 == 169 && octets[2] + 0 == 254)) { bad = 1; exit }
+                print $1 " " $2
+                count++
+            }
+            END {
+                if (bad || inside || starts != 1 || ends != 1 || count < 10 || count > 200 ||
+                    !seen["github.com"] || !seen["raw.githubusercontent.com"]) exit 1
+            }
+        ' "$download" > "$entries" || fail '下载内容校验失败，原 Hosts 未修改'
+        ;;
+    --remove) ;;
+    *) fail '用法: nanami-github-hosts [--update|--remove]' ;;
+esac
+
+next_hosts="$(mktemp "${HOSTS_FILE}.nanami.XXXXXX")"
+cp -a -- "$HOSTS_FILE" "$next_hosts"
+# 只替换本脚本的区块；标记缺失、重复或嵌套时停止，避免误删用户内容。
+awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+    $0 == begin { if (inside || found) bad = 1; inside = 1; found = 1; next }
+    $0 == end { if (!inside) bad = 1; inside = 0; next }
+    !inside { print }
+    END { if (bad || inside) exit 1 }
+' "$HOSTS_FILE" > "$next_hosts" || fail '本脚本的 Hosts 区块标记异常，原 Hosts 未修改'
+
+if [[ "${1:---update}" == --update ]]; then
+    overlaps="$(awk '
+        NR == FNR { domains[$2] = 1; next }
+        /^[[:space:]]*($|#)/ { next }
+        { for (i = 2; i <= NF; i++) if (domains[$i]) { count++; break } }
+        END { print count + 0 }
+    ' "$entries" "$next_hosts")"
+    if [[ "$overlaps" -gt 0 ]]; then
+        printf 'GitHub Hosts: 发现 %s 条已有同域名映射，可能优先于本脚本条目生效\n' "$overlaps" >&2
+    fi
+    printf '%s\n# Source: %s\n' "$BEGIN_MARKER" "$SOURCE_URL" >> "$next_hosts"
+    cat "$entries" >> "$next_hosts"
+    printf '%s\n' "$END_MARKER" >> "$next_hosts"
+fi
+
+if cmp -s -- "$HOSTS_FILE" "$next_hosts"; then
+    echo 'GitHub Hosts 未变化'
+    exit 0
+fi
+
+# 先保留首次和本次更新前的快照，再在同一文件系统内原子替换。
+if [[ ! -e "${STATE_DIR}/hosts-before-github-hosts.bak" ]]; then
+    cp -a -- "$HOSTS_FILE" "${STATE_DIR}/hosts-before-github-hosts.bak"
+fi
+cp -a -- "$HOSTS_FILE" "${STATE_DIR}/hosts-github-hosts-previous.bak"
+mv -f -- "$next_hosts" "$HOSTS_FILE"
+next_hosts=''
+echo 'GitHub Hosts 已更新'
+GITHUB_HOSTS_HELPER
+    chmod 0700 "$tmp"
+    mv -f -- "$tmp" "$GITHUB_HOSTS_BIN"
+}
+
+do_github_hosts_update() {
+    title "=== 更新 GitHub Hosts ==="
+    ensure_packages curl ca-certificates util-linux || return 1
+    install_github_hosts_helper
+    "$GITHUB_HOSTS_BIN" --update
+}
+
+do_github_hosts_enable() {
+    title "=== 启用 GitHub Hosts 定时更新 ==="
+    ensure_packages curl ca-certificates util-linux cron || return 1
+    install_github_hosts_helper
+
+    if systemd_available; then
+        systemctl enable --now cron.service || { err "cron 服务启动失败，未安装定时任务。"; return 1; }
+    elif command_exists service; then
+        service cron start || { err "cron 服务启动失败，未安装定时任务。"; return 1; }
+    else
+        warn "未找到服务管理器，请确认 cron 守护进程正在运行。"
+    fi
+
+    local tmp
+    tmp="$(mktemp "${GITHUB_HOSTS_CRON}.XXXXXX")"
+    cat > "$tmp" <<EOF
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+25 4 * * * root ${GITHUB_HOSTS_BIN} >> ${LOG_DIR}/github-hosts.log 2>&1
+EOF
+    chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$GITHUB_HOSTS_CRON"
+    if ! "$GITHUB_HOSTS_BIN" --update; then
+        warn "定时任务已启用；本次更新失败，之后会按计划重试。"
+        return 1
+    fi
+    ok "已配置每日 04:25 更新 GitHub Hosts。"
+}
+
+remove_github_hosts() {
+    rm -f -- "$GITHUB_HOSTS_CRON"
+    if grep -Fxq -- "$GITHUB_HOSTS_BEGIN" /etc/hosts ||
+       grep -Fxq -- "$GITHUB_HOSTS_END" /etc/hosts; then
+        install_github_hosts_helper
+        "$GITHUB_HOSTS_BIN" --remove || return 1
+    fi
+    rm -f -- "$GITHUB_HOSTS_BIN"
+}
+
+do_github_hosts_disable() {
+    title "=== 停用 GitHub Hosts ==="
+    if ! confirm "移除定时任务和本脚本添加的 Hosts 条目？" "n"; then
+        info "已取消。"
+        return 0
+    fi
+    remove_github_hosts || return 1
+    ok "已移除 GitHub Hosts 定时任务与本脚本管理的条目。"
+}
+
+do_github_hosts_status() {
+    title "=== GitHub Hosts 状态 ==="
+    if [[ -f "$GITHUB_HOSTS_CRON" ]]; then
+        echo "定时任务: 每日 04:25"
+        if systemd_available && ! systemctl is-active --quiet cron.service; then
+            warn "cron 服务未运行，定时任务不会执行。"
+        fi
+    else
+        echo "定时任务: 未启用"
+    fi
+    if grep -Fxq -- "$GITHUB_HOSTS_BEGIN" /etc/hosts &&
+       grep -Fxq -- "$GITHUB_HOSTS_END" /etc/hosts; then
+        echo "Hosts 条目: 已添加"
+    elif grep -Fxq -- "$GITHUB_HOSTS_BEGIN" /etc/hosts ||
+         grep -Fxq -- "$GITHUB_HOSTS_END" /etc/hosts; then
+        warn "Hosts 区块标记不完整，请检查 /etc/hosts。"
+    else
+        echo "Hosts 条目: 未添加"
+    fi
+}
+
+github_hosts_menu() {
+    title "=== GitHub Hosts ==="
+    echo "  1) 启用每日更新（立即更新一次）"
+    echo "  2) 立即更新"
+    echo "  3) 停用并移除条目"
+    echo "  4) 查看状态"
+    echo "  0) 返回"
+    local choice
+    read -r -p "请选择: " choice
+    case "$choice" in
+        1) do_github_hosts_enable ;;
+        2) do_github_hosts_update ;;
+        3) do_github_hosts_disable ;;
+        4) do_github_hosts_status ;;
+        0) return 0 ;;
+        *) warn "无效选择" ;;
+    esac
+}
+
+#-----------------------------------------------------------------------------
 # 7) SSH 密钥（安全改进版，不直接关密码除非确认）
 #-----------------------------------------------------------------------------
 do_ssh_key() {
@@ -1089,6 +1322,7 @@ do_status() {
     echo
     echo "SWAP:"
     swapon --show 2>/dev/null || free -h | grep -i swap || true
+    do_github_hosts_status
 }
 
 #-----------------------------------------------------------------------------
@@ -1100,6 +1334,9 @@ do_uninstall() {
         info "已取消。"
         return 0
     fi
+
+    local github_hosts_remove_failed=0
+    remove_github_hosts || github_hosts_remove_failed=1
 
     systemctl disable --now nanami-boot-apply.service 2>/dev/null || true
     rm -f "$BOOT_APPLY_UNIT" "$BOOT_APPLY_BIN"
@@ -1132,6 +1369,10 @@ do_uninstall() {
 
     sysctl --system >/dev/null 2>&1 || true
     rm -f "$STATE_FILE"
+    if [[ "$github_hosts_remove_failed" -ne 0 ]]; then
+        err "GitHub Hosts 区块移除失败，请检查 /etc/hosts 后重试。"
+        return 1
+    fi
     ok "已移除本脚本管理的配置。/swapfile 与 fstab noatime 如已修改需自行还原。"
     warn "若曾备份：查找 *.nanami.bak"
 }
@@ -1208,6 +1449,7 @@ show_menu() {
     echo "────────────────────────────────────────"
     echo "  8) 查看当前优化状态"
     echo "  9) 卸载 / 还原本脚本配置"
+    echo " 10) GitHub Hosts（可选定时更新）"
     echo "  q) 退出"
     echo "────────────────────────────────────────"
 }
@@ -1226,6 +1468,10 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   sudo bash $0 --tools         仅工具
   sudo bash $0 --clean         仅定时清理
   sudo bash $0 --ssh-key       SSH 密钥
+  sudo bash $0 --github-hosts   启用 GitHub Hosts 每日更新并立即更新
+  sudo bash $0 --github-hosts-update   立即更新 GitHub Hosts
+  sudo bash $0 --github-hosts-disable -y  停用并移除本脚本添加的条目
+  sudo bash $0 --github-hosts-status   查看 GitHub Hosts 状态
   sudo bash $0 --status        查看状态
   sudo bash $0 --uninstall     卸载配置
 
@@ -1238,6 +1484,7 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 说明:
   - 仅启用内核官方 BBR（tcp_bbr），不安装第三方内核、不使用 BBRx
   - 配置写入 drop-in 文件，不覆盖整份 /etc/sysctl.conf
+  - GitHub Hosts 仅在单独选择或传入专用参数时启用，不属于 --all
   - 面向 Ubuntu / Debian KVM VPS；容器/OpenVZ 功能受限
 EOF
 }
@@ -1266,6 +1513,10 @@ parse_args() {
             --tools) actions+=("tools"); NONINTERACTIVE=1; shift ;;
             --clean) actions+=("clean"); NONINTERACTIVE=1; shift ;;
             --ssh-key) actions+=("ssh"); NONINTERACTIVE=1; shift ;;
+            --github-hosts|--github-hosts-enable) actions+=("github-hosts-enable"); NONINTERACTIVE=1; shift ;;
+            --github-hosts-update) actions+=("github-hosts-update"); NONINTERACTIVE=1; shift ;;
+            --github-hosts-disable) actions+=("github-hosts-disable"); NONINTERACTIVE=1; shift ;;
+            --github-hosts-status) actions+=("github-hosts-status"); NONINTERACTIVE=1; shift ;;
             --status) actions+=("status"); NONINTERACTIVE=1; shift ;;
             --uninstall) actions+=("uninstall"); NONINTERACTIVE=1; shift ;;
             *) err "未知参数: $1"; usage; exit 1 ;;
@@ -1287,6 +1538,10 @@ parse_args() {
             tools) do_install_tools ;;
             clean) do_cleanup_cron ;;
             ssh) do_ssh_key ;;
+            github-hosts-enable) do_github_hosts_enable ;;
+            github-hosts-update) do_github_hosts_update ;;
+            github-hosts-disable) do_github_hosts_disable ;;
+            github-hosts-status) do_github_hosts_status ;;
             status) do_status ;;
             uninstall) do_uninstall ;;
         esac
@@ -1311,6 +1566,7 @@ main_menu() {
             7) do_ssh_key; pause ;;
             8) do_status; pause ;;
             9) do_uninstall; pause ;;
+            10) github_hosts_menu; pause ;;
             q|Q|exit) echo "再见。"; exit 0 ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
