@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #=============================================================================
-# Nanami VPS Optimize - 综合优化脚本
-# 定位：Ubuntu / Debian VPS 一站式调优（BBR + 网络 + 系统资源）
+# Nanami Optimize - 综合优化脚本
+# 定位：Ubuntu / Debian VPS 与独立服务器调优（BBR + 网络 + 系统资源）
 # 拥塞控制：仅使用内核官方 BBR（tcp_bbr），不再支持 BBRx
 # 网络调优思路参考：
 #   - https://github.com/Eric86777/vps-tcp-tune
@@ -19,6 +19,9 @@ readonly MODULES_LOAD_FILE="/etc/modules-load.d/nanami-bbr.conf"
 readonly BOOT_APPLY_BIN="/usr/local/sbin/nanami-boot-apply"
 readonly BOOT_APPLY_UNIT="/etc/systemd/system/nanami-boot-apply.service"
 readonly CLEAN_SCRIPT="/usr/local/bin/nanami-clean.sh"
+readonly CLEAN_SERVICE="/etc/systemd/system/nanami-clean.service"
+readonly CLEAN_TIMER="/etc/systemd/system/nanami-clean.timer"
+readonly CLEAN_CRON_SPOOL="/var/spool/cron/crontabs/root"
 readonly GITHUB_HOSTS_BIN="/usr/local/sbin/nanami-github-hosts"
 readonly GITHUB_HOSTS_CRON="/etc/cron.d/nanami-github-hosts"
 readonly GITHUB_HOSTS_BEGIN="# Nanami GitHub Hosts BEGIN"
@@ -26,6 +29,16 @@ readonly GITHUB_HOSTS_END="# Nanami GitHub Hosts END"
 readonly LOG_DIR="/var/log/nanami-optimize"
 readonly STATE_DIR="/etc/nanami-optimize"
 readonly STATE_FILE="${STATE_DIR}/state.env"
+readonly SWAPFILE="/swapfile"
+readonly FSTAB_FILE="/etc/fstab"
+readonly VM_SYSCTL_FILE="/etc/sysctl.d/98-nanami-vm.conf"
+readonly SWAP_STATE="${STATE_DIR}/swapfile.identity"
+readonly SWAP_FSTAB_STATE="${STATE_DIR}/swapfile-fstab.line"
+readonly FSTAB_NOATIME_STATE="${STATE_DIR}/fstab-noatime.lines"
+readonly FSTAB_MOUNT_STATE="${STATE_DIR}/root-atime.mode"
+readonly VM_SYSCTL_STATE="${STATE_DIR}/vm-sysctl.sha256"
+readonly APT_MANAGER_URL="https://raw.githubusercontent.com/yayitinyu/apt/a094549429117def290bddc93dfe58365fec8368/change-apt-src.sh"
+readonly APT_MANAGER_SHA256="85eb4d5bbcfff6b78b955e308c42da1fe94f2e091c7d7a0caf03035dc1881217"
 
 # 运行时状态
 ASSUME_YES=0
@@ -202,6 +215,58 @@ ensure_packages() {
     apt_get install -y --no-install-recommends "${missing[@]}"
 }
 
+# APT_MANAGER_BEGIN
+# Keep mirror handling in the dedicated, pinned APT manager. It backs up sources
+# and rolls them back when apt update fails; no APT action runs in --all.
+run_apt_sources() {
+    case "$OS_ID" in
+        debian|ubuntu) ;;
+        *) err "APT 换源仅支持 Debian / Ubuntu。"; return 1 ;;
+    esac
+
+    local tmp actual_hash result=0
+    tmp="$(mktemp)" || return 1
+    if command_exists curl; then
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 \
+            --proto '=https' --tlsv1.2 -o "$tmp" "$APT_MANAGER_URL"; then
+            rm -f -- "$tmp"
+            err "APT 管理脚本下载失败。"
+            return 1
+        fi
+    elif command_exists wget; then
+        if ! wget -q --timeout=30 -O "$tmp" "$APT_MANAGER_URL"; then
+            rm -f -- "$tmp"
+            err "APT 管理脚本下载失败。"
+            return 1
+        fi
+    else
+        rm -f -- "$tmp"
+        err "APT 换源需要 curl 或 wget。"
+        return 1
+    fi
+
+    actual_hash="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [[ "$actual_hash" != "$APT_MANAGER_SHA256" ]]; then
+        rm -f -- "$tmp"
+        err "APT 管理脚本校验失败，未执行下载内容。"
+        return 1
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f -- "$tmp"
+        err "APT 管理脚本语法检查失败。"
+        return 1
+    fi
+
+    if bash "$tmp" --lang zh "$@"; then
+        result=0
+    else
+        result=$?
+    fi
+    rm -f -- "$tmp"
+    return "$result"
+}
+# APT_MANAGER_END
+
 #-----------------------------------------------------------------------------
 # 文件写入（原子）
 #-----------------------------------------------------------------------------
@@ -209,9 +274,11 @@ write_file() {
     local path="$1"
     local mode="${2:-0644}"
     local tmp
-    tmp="$(mktemp)"
-    cat > "$tmp"
-    install -o root -g root -m "$mode" "$tmp" "$path"
+    tmp="$(mktemp)" || return 1
+    if ! cat > "$tmp" || ! install -o root -g root -m "$mode" "$tmp" "$path"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
 }
 
@@ -478,19 +545,16 @@ EOF
 }
 
 apply_tc_fq() {
-    local dev
+    [[ -n "$PRIMARY_IFACE" ]] || return 0
     if ! command_exists tc; then
-        ensure_packages iproute2 || true
+        ensure_packages iproute2 || return 1
     fi
-    for dev in /sys/class/net/*; do
-        [[ -e "$dev" ]] || continue
-        local name
-        name="$(basename "$dev")"
-        case "$name" in
-            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*|cni*|flannel*|cali*) continue ;;
-        esac
-        tc qdisc replace dev "$name" root fq 2>/dev/null || true
-    done
+    # Replacing a live root qdisc resets its queues. Touch only the egress NIC.
+    if tc qdisc show dev "$PRIMARY_IFACE" 2>/dev/null |
+        awk '$1 == "qdisc" && $2 == "fq" && $4 == "root" { found = 1 } END { exit !found }'; then
+        return 0
+    fi
+    tc qdisc replace dev "$PRIMARY_IFACE" root fq 2>/dev/null || true
 }
 
 apply_mss_clamp() {
@@ -532,14 +596,42 @@ apply_netdev_tuning() {
 
     if command_exists ethtool || ensure_packages ethtool; then
         if [[ "$VIRT_KIND" == "none" ]]; then
-            ethtool -G "$PRIMARY_IFACE" rx 1024 2>/dev/null || true
-            ethtool -G "$PRIMARY_IFACE" tx 2048 2>/dev/null || true
+            grow_nic_rings "$PRIMARY_IFACE"
         else
             # 虚拟机里关闭部分 offload 常能改善延迟抖动（不支持则静默跳过）
             ethtool -K "$PRIMARY_IFACE" tso off gso off gro off 2>/dev/null || true
         fi
     fi
-    ip link set dev "$PRIMARY_IFACE" txqueuelen 10000 2>/dev/null || true
+    if [[ "$(cat "/sys/class/net/${PRIMARY_IFACE}/tx_queue_len" 2>/dev/null)" != 10000 ]]; then
+        ip link set dev "$PRIMARY_IFACE" txqueuelen 10000 2>/dev/null || true
+    fi
+}
+
+grow_nic_rings() {
+    local iface="$1" max_rx max_tx cur_rx cur_tx
+    read -r max_rx max_tx cur_rx cur_tx < <(
+        ethtool -g "$iface" 2>/dev/null | awk '
+            /Pre-set maximums:/ { section = 1; next }
+            /Current hardware settings:/ { section = 2; next }
+            $1 == "RX:" && section == 1 { max_rx = $2 }
+            $1 == "TX:" && section == 1 { max_tx = $2 }
+            $1 == "RX:" && section == 2 { cur_rx = $2 }
+            $1 == "TX:" && section == 2 { cur_tx = $2 }
+            END { print max_rx, max_tx, cur_rx, cur_tx }
+        '
+    )
+    if [[ "$max_rx" =~ ^[0-9]+$ && "$cur_rx" =~ ^[0-9]+$ ]] &&
+       (( max_rx >= 1024 && cur_rx < 1024 )); then
+        ethtool -G "$iface" rx 1024 2>/dev/null || true
+    fi
+    if [[ "$max_tx" =~ ^[0-9]+$ && "$cur_tx" =~ ^[0-9]+$ ]] &&
+       (( max_tx >= 2048 && cur_tx < 2048 )); then
+        ethtool -G "$iface" tx 2048 2>/dev/null || true
+    fi
+}
+
+ipv4_forwarding_enabled() {
+    [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == 1 ]]
 }
 
 write_boot_apply() {
@@ -560,25 +652,38 @@ primary_iface() {
         | cut -d'@' -f1
 }
 
-# fq on physical-ish interfaces
-for d in /sys/class/net/*; do
-    [ -e "$d" ] || continue
-    dev="$(basename "$d")"
-    case "$dev" in
-        lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*|cni*|flannel*|cali*) continue ;;
-    esac
-    tc qdisc replace dev "$dev" root fq 2>/dev/null || true
-done
-
 iface="$(primary_iface || true)"
 if [ -n "${iface:-}" ]; then
-    ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
+    if ! tc qdisc show dev "$iface" 2>/dev/null |
+        awk '$1 == "qdisc" && $2 == "fq" && $4 == "root" { found = 1 } END { exit !found }'; then
+        tc qdisc replace dev "$iface" root fq 2>/dev/null || true
+    fi
+    if [ "$(cat "/sys/class/net/${iface}/tx_queue_len" 2>/dev/null)" != 10000 ]; then
+        ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
+    fi
     if command -v ethtool >/dev/null 2>&1; then
         if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --vm >/dev/null 2>&1; then
             ethtool -K "$iface" tso off gso off gro off 2>/dev/null || true
         elif command -v systemd-detect-virt >/dev/null 2>&1 && ! systemd-detect-virt --container >/dev/null 2>&1; then
-            ethtool -G "$iface" rx 1024 2>/dev/null || true
-            ethtool -G "$iface" tx 2048 2>/dev/null || true
+            read -r max_rx max_tx cur_rx cur_tx < <(
+                ethtool -g "$iface" 2>/dev/null | awk '
+                    /Pre-set maximums:/ { section = 1; next }
+                    /Current hardware settings:/ { section = 2; next }
+                    $1 == "RX:" && section == 1 { max_rx = $2 }
+                    $1 == "TX:" && section == 1 { max_tx = $2 }
+                    $1 == "RX:" && section == 2 { cur_rx = $2 }
+                    $1 == "TX:" && section == 2 { cur_tx = $2 }
+                    END { print max_rx, max_tx, cur_rx, cur_tx }
+                '
+            )
+            if [[ "$max_rx" =~ ^[0-9]+$ && "$cur_rx" =~ ^[0-9]+$ ]] &&
+               (( max_rx >= 1024 && cur_rx < 1024 )); then
+                ethtool -G "$iface" rx 1024 2>/dev/null || true
+            fi
+            if [[ "$max_tx" =~ ^[0-9]+$ && "$cur_tx" =~ ^[0-9]+$ ]] &&
+               (( max_tx >= 2048 && cur_tx < 2048 )); then
+                ethtool -G "$iface" tx 2048 2>/dev/null || true
+            fi
         fi
     fi
 fi
@@ -629,11 +734,16 @@ EOF
 write_sysctl_bbr_network() {
     local bandwidth="${1:-1000}"
     local region="${2:-asia}"
-    local buffer_mb buffer_bytes
+    local buffer_mb buffer_bytes rp_filter=1
 
     compute_memory_params
     buffer_mb="$(calculate_buffer_mb "$bandwidth" "$region")"
     buffer_bytes=$((buffer_mb * 1024 * 1024))
+    # Docker/bridge traffic uses forwarding even on an otherwise single-homed host.
+    # Loose mode still validates source reachability without requiring symmetry.
+    if ipv4_forwarding_enabled; then
+        rp_filter=2
+    fi
 
     # 与内存分层的 rmem_max 取较大值，但不超过内存 cap 后的 buffer
     local rmem_max="$buffer_bytes"
@@ -667,7 +777,6 @@ net.ipv4.tcp_notsent_lowat = ${NOTSENT_LOWAT}
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 5000
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
@@ -691,9 +800,8 @@ vm.dirty_background_bytes = ${DIRTY_BG}
 vm.dirty_bytes = ${DIRTY_BYTES}
 vm.vfs_cache_pressure = 50
 vm.min_free_kbytes = ${MIN_FREE_KB}
-vm.overcommit_memory = 1
 
-# --- Light hardening (non-router VPS) ---
+# --- Light hardening ---
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
@@ -702,8 +810,8 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = ${rp_filter}
+net.ipv4.conf.default.rp_filter = ${rp_filter}
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 kernel.dmesg_restrict = 1
@@ -804,6 +912,182 @@ EOF
 #-----------------------------------------------------------------------------
 # 3) SWAP 调优
 #-----------------------------------------------------------------------------
+ensure_private_state_dir() {
+    mkdir -p -m 0700 -- "$STATE_DIR" && chmod 0700 -- "$STATE_DIR"
+}
+
+# Change one exact fstab line (or append when old is empty), retaining other edits.
+update_fstab_line() {
+    local old="$1" new="$2" snapshot tmp line ending count=0
+    [[ -f "$FSTAB_FILE" && ! -L "$FSTAB_FILE" ]] || return 1
+    snapshot="$(mktemp "${FSTAB_FILE}.nanami.snapshot.XXXXXX")" || return 1
+    tmp="$(mktemp "${FSTAB_FILE}.nanami.edit.XXXXXX")" || { rm -f -- "$snapshot"; return 1; }
+    if ! cp -a -- "$FSTAB_FILE" "$snapshot" || ! cp -a -- "$snapshot" "$tmp" ||
+       ! : > "$tmp"; then
+        rm -f -- "$snapshot" "$tmp"
+        return 1
+    fi
+    while :; do
+        if IFS= read -r line; then
+            ending=$'\n'
+        else
+            [[ -n "$line" ]] || break
+            ending=''
+        fi
+        if [[ -n "$old" && "$line" == "$old" ]]; then
+            ((count += 1))
+            line="$new"
+        fi
+        if [[ -n "$line" ]] && ! printf '%s%s' "$line" "$ending" >> "$tmp"; then
+            rm -f -- "$snapshot" "$tmp"
+            return 1
+        fi
+        [[ -n "$ending" ]] || break
+    done < "$snapshot"
+    if [[ -n "$old" && "$count" -ne 1 ]]; then
+        rm -f -- "$snapshot" "$tmp"
+        return 1
+    fi
+    if [[ -z "$old" ]]; then
+        if [[ -s "$snapshot" && "$(tail -c 1 "$snapshot" | wc -l)" -eq 0 ]]; then
+            printf '\n' >> "$tmp" || { rm -f -- "$snapshot" "$tmp"; return 1; }
+        fi
+        printf '%s\n' "$new" >> "$tmp" || { rm -f -- "$snapshot" "$tmp"; return 1; }
+    fi
+    if ! cmp -s -- "$FSTAB_FILE" "$snapshot" || ! mv -f -- "$tmp" "$FSTAB_FILE"; then
+        rm -f -- "$snapshot" "$tmp"
+        return 1
+    fi
+    rm -f -- "$snapshot"
+}
+
+swap_identity() {
+    local path="${1:-$SWAPFILE}" metadata header_hash
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    metadata="$(TZ=UTC LC_ALL=C stat -c '%d:%i:%s:%y' -- "$path")" || return 1
+    header_hash="$(head -c 4096 -- "$path" | sha256sum | awk '{print $1}')" || return 1
+    printf '%s %s\n' "$metadata" "$header_hash"
+}
+
+read_swap_state() {
+    local lines=() suffix
+    [[ -f "$SWAP_STATE" && ! -L "$SWAP_STATE" ]] || return 1
+    mapfile -t lines < "$SWAP_STATE"
+    [[ "${#lines[@]}" -eq 2 ]] || return 1
+    [[ "${lines[1]}" == "${SWAPFILE}.nanami."* ]] || return 1
+    suffix="${lines[1]#"${SWAPFILE}.nanami."}"
+    [[ "$suffix" =~ ^[[:alnum:]]{8}$ ]] || return 1
+    SWAP_RECORDED_IDENTITY="${lines[0]}"
+    SWAP_RECORDED_TEMP="${lines[1]}"
+}
+
+swap_is_active() {
+    [[ -r /proc/swaps ]] || return 2
+    awk -v path="$SWAPFILE" 'NR > 1 && $1 == path { found = 1 } END { exit !found }' /proc/swaps
+}
+
+swap_fstab_count() {
+    awk -v path="$SWAPFILE" '!/^[[:space:]]*#/ && $1 == path { count++ } END { print count+0 }' "$FSTAB_FILE"
+}
+
+ensure_swap_fstab() {
+    local line="${SWAPFILE} none swap sw 0 0"
+    [[ -f "$FSTAB_FILE" && ! -L "$FSTAB_FILE" ]] || return 1
+    if [[ -e "$SWAP_FSTAB_STATE" || -L "$SWAP_FSTAB_STATE" ]]; then
+        if [[ ! -f "$SWAP_FSTAB_STATE" || -L "$SWAP_FSTAB_STATE" ||
+              "$(cat "$SWAP_FSTAB_STATE")" != "$line" ]]; then
+            err "SWAP 的 fstab 记录已变更，未覆盖用户配置。"
+            return 1
+        fi
+        if [[ "$(swap_fstab_count)" -eq 1 ]] && grep -Fxq -- "$line" "$FSTAB_FILE"; then
+            return 0
+        fi
+        if [[ "$(swap_fstab_count)" -ne 0 ]]; then
+            err "SWAP 的 fstab 记录已变更，未覆盖用户配置。"
+            return 1
+        fi
+        update_fstab_line '' "$line"
+        return $?
+    fi
+    if [[ "$(swap_fstab_count)" -ne 0 ]]; then
+        err "fstab 已有 /swapfile 条目，未覆盖用户配置。"
+        return 1
+    fi
+    ensure_private_state_dir || return 1
+    write_file "$SWAP_FSTAB_STATE" 0600 <<< "$line" || return 1
+    if ! update_fstab_line '' "$line"; then
+        # Leave the marker if a partial write occurred; uninstall can inspect it.
+        [[ "$(swap_fstab_count)" -eq 0 ]] && rm -f -- "$SWAP_FSTAB_STATE"
+        return 1
+    fi
+}
+
+remove_managed_swap() {
+    local identity line was_active=0 active_status
+    if [[ ! -e "$SWAP_STATE" && ! -L "$SWAP_STATE" &&
+          ! -e "$SWAP_FSTAB_STATE" && ! -L "$SWAP_FSTAB_STATE" ]]; then
+        if [[ -e "$SWAPFILE" || -L "$SWAPFILE" ]] ||
+           { [[ -f "$FSTAB_FILE" ]] && [[ "$(swap_fstab_count)" -ne 0 ]]; }; then
+            warn "未标记的 /swapfile 或 fstab SWAP 条目已保留，旧版安装需人工核对。"
+        fi
+        return 0
+    fi
+    [[ -f "$FSTAB_FILE" && ! -L "$FSTAB_FILE" ]] || return 1
+    if ! read_swap_state; then
+        err "SWAP 归属记录缺失或无效，保留 /swapfile。"
+        return 1
+    fi
+    identity="$SWAP_RECORDED_IDENTITY"
+    if [[ -e "$SWAPFILE" || -L "$SWAPFILE" ]]; then
+        if [[ "$identity" != "$(swap_identity)" ]]; then
+            err "/swapfile 已被修改或替换，保留文件和 fstab 条目。"
+            return 1
+        fi
+    fi
+    if [[ -e "$SWAP_RECORDED_TEMP" || -L "$SWAP_RECORDED_TEMP" ]] &&
+       [[ "$identity" != "$(swap_identity "$SWAP_RECORDED_TEMP")" ]]; then
+        err "SWAP 临时文件已被修改，保留文件和恢复记录。"
+        return 1
+    fi
+    if [[ -e "$SWAP_FSTAB_STATE" || -L "$SWAP_FSTAB_STATE" ]]; then
+        [[ -f "$SWAP_FSTAB_STATE" && ! -L "$SWAP_FSTAB_STATE" ]] || return 1
+        line="$(cat "$SWAP_FSTAB_STATE")" || return 1
+        [[ "$line" == "${SWAPFILE} none swap sw 0 0" ]] || return 1
+        if [[ "$(swap_fstab_count)" -ne 0 ]] &&
+           { [[ "$(swap_fstab_count)" -ne 1 ]] || ! grep -Fxq -- "$line" "$FSTAB_FILE"; }; then
+            err "SWAP 的 fstab 条目已被修改，保留 /swapfile。"
+            return 1
+        fi
+    elif [[ "$(swap_fstab_count)" -ne 0 ]]; then
+        err "fstab 包含未标记的 /swapfile 条目，保留 /swapfile。"
+        return 1
+    fi
+    if [[ -e "$SWAPFILE" ]]; then
+        if swap_is_active; then
+            was_active=1
+            swapoff "$SWAPFILE" || { err "无法停用 /swapfile，保留恢复记录。"; return 1; }
+        else
+            active_status=$?
+            [[ "$active_status" -eq 1 ]] || { err "无法读取 SWAP 活动状态。"; return 1; }
+        fi
+    fi
+    if [[ -e "$SWAP_FSTAB_STATE" && "$(swap_fstab_count)" -eq 1 ]] &&
+       ! update_fstab_line "$line" ''; then
+        [[ "$was_active" -eq 1 ]] && swapon "$SWAPFILE" || true
+        err "无法移除本脚本添加的 fstab 条目。"
+        return 1
+    fi
+    if [[ -e "$SWAPFILE" ]] && ! rm -f -- "$SWAPFILE"; then
+        err "无法删除本脚本创建的 /swapfile；保留恢复记录。"
+        return 1
+    fi
+    if [[ -e "$SWAP_RECORDED_TEMP" ]] && ! rm -f -- "$SWAP_RECORDED_TEMP"; then
+        err "无法清理 SWAP 临时文件；保留恢复记录。"
+        return 1
+    fi
+    rm -f -- "$SWAP_FSTAB_STATE" "$SWAP_STATE"
+}
+
 recommended_swap_mb() {
     if   (( MEM_MB < 512 ));  then echo 1024
     elif (( MEM_MB < 1024 )); then echo $(( MEM_MB * 2 ))
@@ -815,24 +1099,136 @@ recommended_swap_mb() {
 
 add_swapfile() {
     local size_mb="$1"
-    local swapfile="/swapfile"
-
-    if swapon --show 2>/dev/null | grep -q "$swapfile"; then
-        swapoff "$swapfile" 2>/dev/null || true
+    local tmp identity actual_size
+    [[ "$size_mb" =~ ^[0-9]+$ && "$size_mb" -gt 0 ]] || return 1
+    [[ -f "$FSTAB_FILE" && ! -L "$FSTAB_FILE" ]] || return 1
+    if [[ -e "$SWAP_STATE" || -L "$SWAP_STATE" ]]; then
+        if ! read_swap_state; then
+            err "SWAP 归属记录无效，未修改。"
+            return 1
+        fi
+        if [[ -e "$SWAP_RECORDED_TEMP" || -L "$SWAP_RECORDED_TEMP" ]] &&
+           [[ "$SWAP_RECORDED_IDENTITY" != "$(swap_identity "$SWAP_RECORDED_TEMP")" ]]; then
+            err "SWAP 临时文件已被修改，未修改。"
+            return 1
+        fi
+        if [[ ! -e "$SWAPFILE" && ! -L "$SWAPFILE" && -e "$SWAP_RECORDED_TEMP" ]]; then
+            ln -- "$SWAP_RECORDED_TEMP" "$SWAPFILE" || return 1
+        fi
+        if [[ ! -f "$SWAPFILE" || -L "$SWAPFILE" ||
+              "$SWAP_RECORDED_IDENTITY" != "$(swap_identity)" ]]; then
+            err "/swapfile 的归属记录与文件不符，未修改。"
+            return 1
+        fi
+        [[ ! -e "$SWAP_RECORDED_TEMP" ]] || rm -f -- "$SWAP_RECORDED_TEMP" || return 1
+        ensure_swap_fstab || return 1
+        if swap_is_active; then
+            :
+        else
+            local active_status=$?
+            [[ "$active_status" -eq 1 ]] || return 1
+            swapon "$SWAPFILE" || return 1
+        fi
+        actual_size="$(stat -c %s -- "$SWAPFILE")"
+        if [[ "$actual_size" -ne "$((size_mb * 1024 * 1024))" ]]; then
+            warn "已有本脚本创建的 /swapfile；为保留可回滚状态，未自动重建大小。"
+        fi
+        return 0
     fi
-    rm -f "$swapfile"
-
-    info "创建 ${size_mb}MB SWAP：${swapfile}"
-    if ! fallocate -l "$((size_mb))M" "$swapfile" 2>/dev/null; then
-        dd if=/dev/zero of="$swapfile" bs=1M count="$size_mb" status=progress
+    if [[ -e "$SWAPFILE" || -L "$SWAPFILE" || -e "$SWAP_FSTAB_STATE" ||
+          -L "$SWAP_FSTAB_STATE" ||
+          "$(swap_fstab_count)" -ne 0 ]]; then
+        warn "已有未标记的 /swapfile 或 fstab 条目，未覆盖用户配置。"
+        return 0
     fi
-    chmod 600 "$swapfile"
-    mkswap "$swapfile" >/dev/null
-    swapon "$swapfile"
-    if ! grep -qE '^\s*/swapfile\s' /etc/fstab 2>/dev/null; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    ensure_private_state_dir || return 1
+    tmp="$(mktemp "${SWAPFILE}.nanami.XXXXXXXX")" || return 1
+    info "创建 ${size_mb}MB SWAP：${SWAPFILE}"
+    if ! fallocate -l "${size_mb}M" "$tmp" 2>/dev/null &&
+       ! dd if=/dev/zero of="$tmp" bs=1M count="$size_mb" status=none; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp" || ! mkswap "$tmp" >/dev/null; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    # Record the inode before publishing it at /swapfile, so an interruption is recoverable.
+    identity="$(swap_identity "$tmp")" || { rm -f -- "$tmp"; return 1; }
+    if ! write_file "$SWAP_STATE" 0600 <<EOF
+${identity}
+${tmp}
+EOF
+    then
+        rm -f -- "$tmp" "$SWAP_STATE"
+        return 1
+    fi
+    if ! ln -- "$tmp" "$SWAPFILE"; then
+        rm -f -- "$tmp" "$SWAP_STATE"
+        return 1
+    fi
+    rm -f -- "$tmp"
+    if ! ensure_swap_fstab || ! swapon "$SWAPFILE"; then
+        remove_managed_swap || true
+        return 1
     fi
     ok "SWAP ${size_mb}MB 已启用"
+}
+
+install_vm_sysctl() {
+    local desired_hash current_hash
+    desired_hash="$(printf '# Nanami VM helpers\nvm.swappiness = %s\nvm.vfs_cache_pressure = 50\n' "$SWAPPINESS" | sha256sum | awk '{print $1}')"
+    if [[ -e "$VM_SYSCTL_FILE" || -L "$VM_SYSCTL_FILE" ]]; then
+        if [[ ! -f "$VM_SYSCTL_STATE" || -L "$VM_SYSCTL_STATE" ||
+              -L "$VM_SYSCTL_FILE" ]]; then
+            warn "已有未标记的 VM sysctl 配置，未覆盖。"
+            return 0
+        fi
+        current_hash="$(sha256sum -- "$VM_SYSCTL_FILE" | awk '{print $1}')" || return 1
+        if [[ "$current_hash" != "$(cat "$VM_SYSCTL_STATE")" ]]; then
+            warn "VM sysctl 配置已被修改，未覆盖。"
+            return 0
+        fi
+        return 0
+    fi
+    if [[ -e "$VM_SYSCTL_STATE" || -L "$VM_SYSCTL_STATE" ]]; then
+        if [[ ! -f "$VM_SYSCTL_STATE" || -L "$VM_SYSCTL_STATE" ||
+              "$(cat "$VM_SYSCTL_STATE")" != "$desired_hash" ]]; then
+            err "VM sysctl 恢复记录与当前参数不符，未写入。"
+            return 1
+        fi
+    fi
+    ensure_private_state_dir || return 1
+    write_file "$VM_SYSCTL_STATE" 0600 <<< "$desired_hash" || return 1
+    if ! write_file "$VM_SYSCTL_FILE" 0644 <<EOF
+# Nanami VM helpers
+vm.swappiness = ${SWAPPINESS}
+vm.vfs_cache_pressure = 50
+EOF
+    then
+        [[ ! -e "$VM_SYSCTL_FILE" ]] && rm -f -- "$VM_SYSCTL_STATE"
+        return 1
+    fi
+    sysctl -e -p "$VM_SYSCTL_FILE" >/dev/null 2>&1 || true
+}
+
+remove_vm_sysctl() {
+    local current_hash
+    if [[ ! -e "$VM_SYSCTL_STATE" && ! -L "$VM_SYSCTL_STATE" ]]; then
+        [[ ! -e "$VM_SYSCTL_FILE" ]] || warn "未标记的 VM sysctl 配置已保留：${VM_SYSCTL_FILE}"
+        return 0
+    fi
+    [[ -f "$VM_SYSCTL_STATE" && ! -L "$VM_SYSCTL_STATE" ]] || return 1
+    if [[ -e "$VM_SYSCTL_FILE" || -L "$VM_SYSCTL_FILE" ]]; then
+        [[ -f "$VM_SYSCTL_FILE" && ! -L "$VM_SYSCTL_FILE" ]] || return 1
+        current_hash="$(sha256sum -- "$VM_SYSCTL_FILE" | awk '{print $1}')" || return 1
+        if [[ "$current_hash" != "$(cat "$VM_SYSCTL_STATE")" ]]; then
+            err "VM sysctl 配置已被修改，保留文件和恢复记录。"
+            return 1
+        fi
+        rm -f -- "$VM_SYSCTL_FILE" || return 1
+    fi
+    rm -f -- "$VM_SYSCTL_STATE"
 }
 
 do_swap_tune() {
@@ -853,12 +1249,13 @@ do_swap_tune() {
     fi
 
     if (( swap_total == 0 )) || (( swap_total < recommended / 2 )); then
-        if confirm "是否创建/调整 /swapfile 为 ${recommended}MB？" "y"; then
+        if confirm "是否创建 /swapfile（目标 ${recommended}MB）？" "y"; then
             add_swapfile "$recommended"
         fi
     else
         ok "当前 SWAP 已足够，无需强制调整。"
-        if confirm "仍要强制重建为 ${recommended}MB？" "n"; then
+        if [[ "$NONINTERACTIVE" -eq 0 ]] &&
+           confirm "仍要创建本脚本管理的 /swapfile（目标 ${recommended}MB）？" "n"; then
             add_swapfile "$recommended"
         fi
     fi
@@ -866,12 +1263,7 @@ do_swap_tune() {
     # swappiness 写入独立 drop-in 片段（若主网络 conf 已存在则合并意图已覆盖）
     if [[ ! -f "$SYSCTL_FILE" ]]; then
         compute_memory_params
-        write_file /etc/sysctl.d/98-nanami-vm.conf 0644 <<EOF
-# Nanami VM helpers
-vm.swappiness = ${SWAPPINESS}
-vm.vfs_cache_pressure = 50
-EOF
-        sysctl -e -p /etc/sysctl.d/98-nanami-vm.conf >/dev/null 2>&1 || true
+        install_vm_sysctl || return 1
     fi
     ok "内存/SWAP 调优完成。"
 }
@@ -879,6 +1271,74 @@ EOF
 #-----------------------------------------------------------------------------
 # 4) 磁盘 noatime
 #-----------------------------------------------------------------------------
+fstab_with_noatime() {
+    local line="$1" prefix options suffix
+    local pattern='^([[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+/[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)(.*)$'
+    [[ "$line" =~ $pattern ]] || return 1
+    prefix="${BASH_REMATCH[1]}"
+    options="${BASH_REMATCH[2]}"
+    suffix="${BASH_REMATCH[3]}"
+    [[ ",$options," != *,noatime,* ]] || return 1
+    printf '%s%s,noatime%s' "$prefix" "$options" "$suffix"
+}
+
+fstab_root_line() {
+    local count
+    count="$(awk '!/^[[:space:]]*#/ && $2 == "/" { count++ } END { print count+0 }' "$FSTAB_FILE")" || return 1
+    [[ "$count" -eq 1 ]] || return 1
+    awk '!/^[[:space:]]*#/ && $2 == "/" { print }' "$FSTAB_FILE"
+}
+
+root_atime_mode() {
+    local options
+    options="$(findmnt -no OPTIONS / 2>/dev/null)" || return 1
+    case ",$options," in
+        *,noatime,*) printf 'noatime\n' ;;
+        *,strictatime,*) printf 'strictatime\n' ;;
+        *,relatime,*) printf 'relatime\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_root_atime() {
+    local prior current
+    [[ -e "$FSTAB_MOUNT_STATE" || -L "$FSTAB_MOUNT_STATE" ]] || return 0
+    [[ -f "$FSTAB_MOUNT_STATE" && ! -L "$FSTAB_MOUNT_STATE" ]] || return 1
+    prior="$(cat "$FSTAB_MOUNT_STATE")" || return 1
+    [[ "$prior" == relatime || "$prior" == strictatime ]] || return 1
+    current="$(root_atime_mode)" || { err "无法确认根分区当前 atime 模式。"; return 1; }
+    if [[ "$current" == noatime ]]; then
+        if ! mount -o "remount,${prior}" / || [[ "$(root_atime_mode)" != "$prior" ]]; then
+            err "恢复根分区运行时 ${prior} 失败；保留状态以便重试。"
+            return 1
+        fi
+    fi
+    rm -f -- "$FSTAB_MOUNT_STATE"
+}
+
+restore_fstab_noatime() {
+    local lines=() current expected
+    if [[ -e "$FSTAB_NOATIME_STATE" || -L "$FSTAB_NOATIME_STATE" ]]; then
+        [[ -f "$FSTAB_NOATIME_STATE" && ! -L "$FSTAB_NOATIME_STATE" ]] || return 1
+        mapfile -t lines < "$FSTAB_NOATIME_STATE"
+        if [[ "${#lines[@]}" -ne 2 ]] ||
+           ! expected="$(fstab_with_noatime "${lines[0]}")" ||
+           [[ "$expected" != "${lines[1]}" ]]; then
+            err "fstab noatime 恢复记录无效，保留现有配置。"
+            return 1
+        fi
+        current="$(fstab_root_line)" || { err "根分区 fstab 条目不唯一，保留现有配置。"; return 1; }
+        if [[ "$current" == "${lines[1]}" ]]; then
+            update_fstab_line "${lines[1]}" "${lines[0]}" || return 1
+        elif [[ "$current" != "${lines[0]}" ]]; then
+            err "根分区 fstab 条目已被修改，保留现有配置和恢复记录。"
+            return 1
+        fi
+        rm -f -- "$FSTAB_NOATIME_STATE" || return 1
+    fi
+    restore_root_atime
+}
+
 do_disk_tune() {
     title "=== 4) 磁盘优化（noatime） ==="
 
@@ -887,22 +1347,12 @@ do_disk_tune() {
         return 0
     fi
 
-    if [[ ! -f /etc/fstab ]]; then
+    if [[ ! -f "$FSTAB_FILE" || -L "$FSTAB_FILE" ]]; then
         warn "未找到 /etc/fstab，跳过。"
         return 0
     fi
-
-    backup_if_exists /etc/fstab
-
-    local root_src root_fstype
-    root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+    local root_fstype root_line updated_line lines=() prior saved_prior
     root_fstype="$(findmnt -no FSTYPE / 2>/dev/null || true)"
-
-    if [[ -z "$root_src" ]]; then
-        warn "无法检测根分区，跳过。"
-        return 0
-    fi
-
     case "$root_fstype" in
         ext4|ext3|xfs|btrfs) ;;
         *)
@@ -911,33 +1361,57 @@ do_disk_tune() {
             ;;
     esac
 
-    # 对匹配根设备的 fstab 行追加 noatime（若尚未包含）
-    if awk -v src="$root_src" '
-        $1 == src || index($1, src) {
-            if ($4 ~ /(^|,)noatime(,|$)/) found=1
-        }
-        END { exit found ? 0 : 1 }
-    ' /etc/fstab; then
-        ok "根分区已包含 noatime。"
-    else
-        # 使用 UUID 更稳妥
-        local uuid
-        uuid="$(findmnt -no UUID / 2>/dev/null || true)"
-        if [[ -n "$uuid" ]] && grep -q "UUID=${uuid}" /etc/fstab; then
-            sed -i -E "s|(UUID=${uuid}[[:space:]]+/[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)|\1\2,noatime|" /etc/fstab
-            # 去重 noatime
-            sed -i -E "s/,noatime,noatime/,noatime/g" /etc/fstab
-        else
-            # 回退：按 SOURCE 匹配
-            sed -i -E "s|(${root_src//\//\\/}[[:space:]]+/[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)|\1\2,noatime|" /etc/fstab
+    root_line="$(fstab_root_line)" || { warn "根分区 fstab 条目缺失或不唯一，跳过。"; return 0; }
+    if [[ -e "$FSTAB_NOATIME_STATE" || -L "$FSTAB_NOATIME_STATE" ]]; then
+        [[ -f "$FSTAB_NOATIME_STATE" && ! -L "$FSTAB_NOATIME_STATE" ]] || return 1
+        mapfile -t lines < "$FSTAB_NOATIME_STATE"
+        if [[ "${#lines[@]}" -ne 2 ]] ||
+           ! updated_line="$(fstab_with_noatime "${lines[0]}")" ||
+           [[ "$updated_line" != "${lines[1]}" ]] ||
+           [[ "$root_line" != "${lines[0]}" && "$root_line" != "${lines[1]}" ]]; then
+            err "fstab 与恢复记录不符，未修改。"
+            return 1
         fi
-        ok "已尝试为根分区添加 noatime"
-    fi
-
-    if mount -o remount,noatime / 2>/dev/null; then
-        ok "已 remount / 使用 noatime"
+        if [[ "$root_line" == "${lines[0]}" ]]; then
+            update_fstab_line "${lines[0]}" "${lines[1]}" || return 1
+        fi
     else
-        warn "即时 remount 失败（可能已生效或受策略限制）。重启后 fstab 生效。"
+        if ! updated_line="$(fstab_with_noatime "$root_line")"; then
+            ok "根分区已包含 noatime，未修改。"
+            return 0
+        fi
+        backup_if_exists "$FSTAB_FILE" || return 1
+        ensure_private_state_dir || return 1
+        write_file "$FSTAB_NOATIME_STATE" 0600 <<EOF
+${root_line}
+${updated_line}
+EOF
+        if ! update_fstab_line "$root_line" "$updated_line"; then
+            [[ "$(fstab_root_line)" == "$root_line" ]] && rm -f -- "$FSTAB_NOATIME_STATE"
+            return 1
+        fi
+    fi
+    prior="$(root_atime_mode)" || prior=''
+    if [[ "$prior" == relatime || "$prior" == strictatime ]]; then
+        if [[ -e "$FSTAB_MOUNT_STATE" || -L "$FSTAB_MOUNT_STATE" ]]; then
+            [[ -f "$FSTAB_MOUNT_STATE" && ! -L "$FSTAB_MOUNT_STATE" ]] || return 1
+            saved_prior="$(cat "$FSTAB_MOUNT_STATE")" || return 1
+            [[ "$saved_prior" == relatime || "$saved_prior" == strictatime ]] || return 1
+            if [[ "$prior" != "$saved_prior" ]]; then
+                warn "根分区运行时 atime 模式已被修改，未再次 remount。"
+                return 0
+            fi
+        else
+            write_file "$FSTAB_MOUNT_STATE" 0600 <<< "$prior" || return 1
+        fi
+        if mount -o remount,noatime / 2>/dev/null && [[ "$(root_atime_mode)" == noatime ]]; then
+            ok "已为根分区添加并启用 noatime。"
+        else
+            [[ "$(root_atime_mode)" == "$prior" ]] && rm -f -- "$FSTAB_MOUNT_STATE"
+            warn "即时 remount 失败；重启后 fstab 生效。"
+        fi
+    else
+        ok "已为根分区配置 noatime。"
     fi
 }
 
@@ -954,10 +1428,197 @@ do_install_tools() {
 #-----------------------------------------------------------------------------
 # 6) 定时清理
 #-----------------------------------------------------------------------------
-do_cleanup_cron() {
-    title "=== 6) 定时清理任务 ==="
+cleanup_cron_available() {
+    command_exists crontab || return 1
+    if systemd_available; then
+        # A running but disabled cron would stop executing this job after reboot.
+        systemctl is-active --quiet cron.service && systemctl is-enabled --quiet cron.service
+    elif command_exists service; then
+        service cron status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
 
-    write_file "$CLEAN_SCRIPT" 0755 <<'EOF'
+check_inaccessible_cleanup_crontab() {
+    local grep_result
+    command_exists crontab && return 0
+    [[ -e "$CLEAN_CRON_SPOOL" ]] || return 0
+    if [[ ! -r "$CLEAN_CRON_SPOOL" ]]; then
+        err "无法读取 root crontab 数据，未修改定时清理。"
+        return 1
+    fi
+    if grep -Fq -- "$CLEAN_SCRIPT" "$CLEAN_CRON_SPOOL"; then
+        err "root crontab 中已有旧版清理任务，但缺少 crontab 命令，无法安全切换或卸载。"
+        return 1
+    else
+        grep_result=$?
+        if [[ "$grep_result" -ne 1 ]]; then
+            err "读取 root crontab 数据失败，未修改定时清理。"
+            return 1
+        fi
+    fi
+}
+
+update_cleanup_crontab() {
+    local mode="$1" current next errors had_crontab=1 result=0
+    if ! command_exists crontab; then
+        [[ "$mode" == remove ]] && return 0
+        err "缺少 crontab 命令，无法安装 cron 定时任务。"
+        return 1
+    fi
+    current="$(mktemp)" || return 1
+    next="$(mktemp)" || { rm -f -- "$current"; return 1; }
+    errors="$(mktemp)" || { rm -f -- "$current" "$next"; return 1; }
+
+    if ! LC_ALL=C crontab -l > "$current" 2> "$errors"; then
+        if grep -q '^no crontab for ' "$errors"; then
+            had_crontab=0
+        else
+            err "读取 root crontab 失败，未修改定时任务：$(cat "$errors")"
+            rm -f -- "$current" "$next" "$errors"
+            return 1
+        fi
+    fi
+
+    if grep -vF -- "$CLEAN_SCRIPT" "$current" > "$next"; then
+        :
+    else
+        result=$?
+        if [[ "$result" -ne 1 ]]; then
+            err "处理 root crontab 失败，未修改定时任务。"
+            rm -f -- "$current" "$next" "$errors"
+            return 1
+        fi
+    fi
+    result=0
+    if [[ "$mode" == install ]]; then
+        printf '0 3 * * * %s >/dev/null 2>&1\n' "$CLEAN_SCRIPT" >> "$next"
+    fi
+
+    if cmp -s -- "$current" "$next"; then
+        :
+    else
+        result=$?
+        if [[ "$result" -ne 1 ]]; then
+            err "比较 root crontab 失败，未修改定时任务。"
+            rm -f -- "$current" "$next" "$errors"
+            return 1
+        fi
+        result=0
+        if [[ "$mode" == remove && ! -s "$next" ]]; then
+            if [[ "$had_crontab" -eq 1 ]]; then
+                crontab -r || result=$?
+            fi
+        else
+            crontab "$next" || result=$?
+        fi
+    fi
+    rm -f -- "$current" "$next" "$errors"
+    return "$result"
+}
+
+cleanup_timer_owned() {
+    local unit
+    for unit in "$CLEAN_TIMER" "$CLEAN_SERVICE"; do
+        if [[ -e "$unit" ]] && ! grep -Fxq '# Managed by Nanami VPS Optimize' "$unit"; then
+            err "发现非本脚本管理的 systemd unit，未修改：${unit}"
+            return 1
+        fi
+    done
+}
+
+remove_cleanup_timer() {
+    local had_unit=0
+    cleanup_timer_owned || return 1
+    [[ -e "$CLEAN_TIMER" || -e "$CLEAN_SERVICE" ]] && had_unit=1
+    if [[ "$had_unit" -eq 0 ]] && systemd_available &&
+       systemctl is-active --quiet nanami-clean.timer; then
+        err "清理 timer 仍在运行，但找不到本脚本管理的 unit 文件。"
+        return 1
+    fi
+    if [[ "$had_unit" -eq 1 ]] && systemd_available; then
+        if systemctl is-active --quiet nanami-clean.timer ||
+           systemctl is-enabled --quiet nanami-clean.timer; then
+            systemctl disable --now nanami-clean.timer || return 1
+        fi
+    fi
+    rm -f -- "$CLEAN_TIMER" "$CLEAN_SERVICE" || return 1
+    if [[ "$had_unit" -eq 1 ]] && systemd_available; then
+        systemctl daemon-reload || return 1
+    fi
+}
+
+install_cleanup_timer() {
+    local had_timer=0
+    cleanup_timer_owned || return 1
+    [[ -e "$CLEAN_TIMER" || -e "$CLEAN_SERVICE" ]] && had_timer=1
+
+    if ! write_file "$CLEAN_SERVICE" 0644 <<EOF
+# Managed by Nanami VPS Optimize
+[Unit]
+Description=Nanami daily cleanup
+
+[Service]
+Type=oneshot
+ExecStart=${CLEAN_SCRIPT}
+EOF
+    then
+        err "写入清理服务失败：${CLEAN_SERVICE}"
+        return 1
+    fi
+    if ! write_file "$CLEAN_TIMER" 0644 <<'EOF'
+# Managed by Nanami VPS Optimize
+[Unit]
+Description=Nanami daily cleanup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Match cron behavior: enabling the timer does not immediately run a missed job.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+    then
+        err "写入清理 timer 失败：${CLEAN_TIMER}"
+        if [[ "$had_timer" -eq 0 ]]; then
+            remove_cleanup_timer || true
+        fi
+        return 1
+    fi
+    if ! systemctl daemon-reload ||
+       ! systemctl enable --now nanami-clean.timer ||
+       ! systemctl is-active --quiet nanami-clean.timer ||
+       ! systemctl is-enabled --quiet nanami-clean.timer; then
+        err "systemd timer 启用或验证失败，请检查定时任务状态。"
+        if [[ "$had_timer" -eq 0 ]]; then
+            remove_cleanup_timer || true
+        fi
+        return 1
+    fi
+
+    if ! update_cleanup_crontab remove; then
+        err "旧版 crontab 条目未能移除，请检查以免重复执行。"
+        if [[ "$had_timer" -eq 0 ]]; then
+            remove_cleanup_timer || true
+        fi
+        return 1
+    fi
+}
+
+remove_cleanup_schedule() {
+    check_inaccessible_cleanup_crontab || return 1
+    remove_cleanup_timer || return 1
+    update_cleanup_crontab remove || return 1
+    rm -f -- "$CLEAN_SCRIPT"
+}
+
+do_cleanup_schedule() {
+    title "=== 6) 定时清理任务 ==="
+    check_inaccessible_cleanup_crontab || return 1
+
+    if ! write_file "$CLEAN_SCRIPT" 0755 <<'EOF'
 #!/usr/bin/env bash
 # Nanami daily cleanup — safe defaults
 set -euo pipefail
@@ -972,15 +1633,31 @@ find /var/log -type f -name '*.gz' -mtime +14 -delete 2>/dev/null || true
 find /var/log -type f -name '*.1' -mtime +14 -delete 2>/dev/null || true
 find /tmp -type f -atime +7 -delete 2>/dev/null || true
 EOF
+    then
+        err "写入清理脚本失败：${CLEAN_SCRIPT}"
+        return 1
+    fi
 
-    # 去掉旧版 clean.sh / 本脚本重复项
-    local tmpcron
-    tmpcron="$(mktemp)"
-    crontab -l 2>/dev/null | grep -v 'nanami-clean.sh' | grep -v '/usr/local/bin/clean.sh' > "$tmpcron" || true
-    echo "0 3 * * * ${CLEAN_SCRIPT} >/dev/null 2>&1" >> "$tmpcron"
-    crontab "$tmpcron"
-    rm -f "$tmpcron"
-    ok "已配置每日 03:00 清理：${CLEAN_SCRIPT}"
+    if cleanup_cron_available; then
+        if ! update_cleanup_crontab install; then
+            err "root crontab 写入失败，未切换定时清理。"
+            return 1
+        fi
+        if ! remove_cleanup_timer; then
+            update_cleanup_crontab remove || true
+            err "旧版 timer 未能停用，已尝试撤销新 cron 条目。"
+            return 1
+        fi
+        ok "已通过 cron 配置每日 03:00 清理：${CLEAN_SCRIPT}"
+        return 0
+    fi
+
+    if ! systemd_available; then
+        err "没有可用的 cron，也没有运行中的 systemd，无法配置定时清理。"
+        return 1
+    fi
+    install_cleanup_timer || return 1
+    ok "已通过 systemd timer 配置每日 03:00 清理：${CLEAN_SCRIPT}"
 }
 
 #-----------------------------------------------------------------------------
@@ -1335,28 +2012,23 @@ do_uninstall() {
         return 0
     fi
 
-    local github_hosts_remove_failed=0
+    local cleanup_failed=0 github_hosts_remove_failed=0 restore_failed=0
+    remove_cleanup_schedule || cleanup_failed=1
     remove_github_hosts || github_hosts_remove_failed=1
+    remove_managed_swap || restore_failed=1
+    restore_fstab_noatime || restore_failed=1
+    remove_vm_sysctl || restore_failed=1
 
     systemctl disable --now nanami-boot-apply.service 2>/dev/null || true
     rm -f "$BOOT_APPLY_UNIT" "$BOOT_APPLY_BIN"
     systemctl daemon-reload 2>/dev/null || true
 
     rm -f "$SYSCTL_FILE" \
-          /etc/sysctl.d/98-nanami-vm.conf \
           "$LIMITS_FILE" \
           "$SYSTEMD_LIMITS_FILE" \
           "$MODULES_LOAD_FILE" \
           /etc/ssh/sshd_config.d/99-nanami-pubkey.conf \
-          /etc/ssh/sshd_config.d/99-nanami-keyonly.conf \
-          "$CLEAN_SCRIPT"
-
-    # 清理 crontab
-    local tmpcron
-    tmpcron="$(mktemp)"
-    crontab -l 2>/dev/null | grep -v 'nanami-clean.sh' > "$tmpcron" || true
-    crontab "$tmpcron" 2>/dev/null || true
-    rm -f "$tmpcron"
+          /etc/ssh/sshd_config.d/99-nanami-keyonly.conf
 
     # 尝试移除 MSS clamp
     if command_exists iptables; then
@@ -1369,11 +2041,20 @@ do_uninstall() {
 
     sysctl --system >/dev/null 2>&1 || true
     rm -f "$STATE_FILE"
+    if [[ "$cleanup_failed" -ne 0 ]]; then
+        err "定时清理卸载失败，请检查 cron 和 timer。"
+    fi
     if [[ "$github_hosts_remove_failed" -ne 0 ]]; then
         err "GitHub Hosts 区块移除失败，请检查 /etc/hosts 后重试。"
+    fi
+    if [[ "$restore_failed" -ne 0 ]]; then
+        err "SWAP、fstab 或 VM 配置未能完全恢复；恢复记录已保留，请检查后重试。"
+    fi
+    if [[ "$cleanup_failed" -ne 0 || "$github_hosts_remove_failed" -ne 0 ||
+          "$restore_failed" -ne 0 ]]; then
         return 1
     fi
-    ok "已移除本脚本管理的配置。/swapfile 与 fstab noatime 如已修改需自行还原。"
+    ok "已移除本脚本管理的配置，并恢复可确认归属的 SWAP 与 noatime 更改。"
     warn "若曾备份：查找 *.nanami.bak"
 }
 
@@ -1401,7 +2082,7 @@ do_all() {
     do_swap_tune
     do_disk_tune
     do_install_tools
-    do_cleanup_cron
+    do_cleanup_schedule
 
     echo
     ok "一键优化流程结束。"
@@ -1450,6 +2131,7 @@ show_menu() {
     echo "  8) 查看当前优化状态"
     echo "  9) 卸载 / 还原本脚本配置"
     echo " 10) GitHub Hosts（可选定时更新）"
+    echo " 11) APT 换源（可选）"
     echo "  q) 退出"
     echo "────────────────────────────────────────"
 }
@@ -1472,6 +2154,9 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   sudo bash $0 --github-hosts-update   立即更新 GitHub Hosts
   sudo bash $0 --github-hosts-disable -y  停用并移除本脚本添加的条目
   sudo bash $0 --github-hosts-status   查看 GitHub Hosts 状态
+  sudo bash $0 --apt-sources   APT 换源菜单
+  sudo bash $0 --apt-sources-list   查看可用源
+  sudo bash $0 --apt-sources-restore   恢复最近一次源备份
   sudo bash $0 --status        查看状态
   sudo bash $0 --uninstall     卸载配置
 
@@ -1484,8 +2169,9 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 说明:
   - 仅启用内核官方 BBR（tcp_bbr），不安装第三方内核、不使用 BBRx
   - 配置写入 drop-in 文件，不覆盖整份 /etc/sysctl.conf
-  - GitHub Hosts 仅在单独选择或传入专用参数时启用，不属于 --all
-  - 面向 Ubuntu / Debian KVM VPS；容器/OpenVZ 功能受限
+  - GitHub Hosts 与 APT 换源仅在单独选择或传入专用参数时启用，不属于 --all
+  - APT 换源下载固定版本脚本并校验 SHA-256，改源前确认并备份
+  - 面向 Ubuntu / Debian VPS 与独立服务器；容器/OpenVZ 功能受限
 EOF
 }
 
@@ -1517,8 +2203,11 @@ parse_args() {
             --github-hosts-update) actions+=("github-hosts-update"); NONINTERACTIVE=1; shift ;;
             --github-hosts-disable) actions+=("github-hosts-disable"); NONINTERACTIVE=1; shift ;;
             --github-hosts-status) actions+=("github-hosts-status"); NONINTERACTIVE=1; shift ;;
+            --apt-sources) actions+=("apt-sources"); shift ;;
+            --apt-sources-list) actions+=("apt-sources-list"); NONINTERACTIVE=1; shift ;;
+            --apt-sources-restore) actions+=("apt-sources-restore"); shift ;;
             --status) actions+=("status"); NONINTERACTIVE=1; shift ;;
-            --uninstall) actions+=("uninstall"); NONINTERACTIVE=1; shift ;;
+            --uninstall) actions+=("uninstall"); shift ;;
             *) err "未知参数: $1"; usage; exit 1 ;;
         esac
     done
@@ -1536,12 +2225,15 @@ parse_args() {
             swap) do_swap_tune ;;
             disk) do_disk_tune ;;
             tools) do_install_tools ;;
-            clean) do_cleanup_cron ;;
+            clean) do_cleanup_schedule ;;
             ssh) do_ssh_key ;;
             github-hosts-enable) do_github_hosts_enable ;;
             github-hosts-update) do_github_hosts_update ;;
             github-hosts-disable) do_github_hosts_disable ;;
             github-hosts-status) do_github_hosts_status ;;
+            apt-sources) run_apt_sources ;;
+            apt-sources-list) run_apt_sources --list ;;
+            apt-sources-restore) run_apt_sources --restore ;;
             status) do_status ;;
             uninstall) do_uninstall ;;
         esac
@@ -1562,11 +2254,12 @@ main_menu() {
             3) do_swap_tune; pause ;;
             4) do_disk_tune; pause ;;
             5) do_install_tools; pause ;;
-            6) do_cleanup_cron; pause ;;
+            6) do_cleanup_schedule; pause ;;
             7) do_ssh_key; pause ;;
             8) do_status; pause ;;
             9) do_uninstall; pause ;;
             10) github_hosts_menu; pause ;;
+            11) run_apt_sources; pause ;;
             q|Q|exit) echo "再见。"; exit 0 ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
@@ -1576,6 +2269,9 @@ main_menu() {
 main() {
     require_root
     ensure_dirs
+    ensure_private_state_dir || { err "无法创建恢复状态目录。"; return 1; }
+    exec 8>"${STATE_DIR}/run.lock" || return 1
+    flock -w 60 8 || { err "等待另一优化任务结束超时。"; return 1; }
     detect_system
     log_msg INFO "start v${SCRIPT_VERSION} os=${OS_NAME} mem=${MEM_MB} virt=${VIRT_KIND}"
 

@@ -26,7 +26,33 @@ jobs:
           bash -n key.sh
           bash -n nanami_optimize_universal.sh
           bash -n tests/test_github_hosts.sh
+          bash -n tests/test_cleanup_schedule.sh
+          bash -n tests/test_uninstall_restore.sh
+          bash -n tests/test_apt_sources.sh
+          bash -n tests/test_dedicated_server.sh
 
       - name: Test GitHub Hosts updater
         shell: bash
         run: bash tests/test_github_hosts.sh
+
+      - name: Test uninstall recovery in isolation
+        shell: bash
+        run: bash tests/test_uninstall_restore.sh
+
+      - name: Test optional APT sources and dedicated server tuning
+        shell: bash
+        run: |
+          bash tests/test_apt_sources.sh
+          bash tests/test_dedicated_server.sh
+
+      - name: Smoke test cleanup and recovery in Debian and Ubuntu containers
+        shell: bash
+        run: |
+          for image in debian:bookworm-slim ubuntu:24.04; do
+            docker run --rm --network none \
+              --mount "type=bind,source=$PWD,target=/src,readonly" \
+              --workdir /src "$image" bash tests/test_cleanup_schedule.sh
+            docker run --rm --network none \
+              --mount "type=bind,source=$PWD,target=/src,readonly" \
+              --workdir /src "$image" bash tests/test_uninstall_restore.sh
+          done

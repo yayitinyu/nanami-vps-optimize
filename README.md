@@ -1,6 +1,6 @@
 # Nanami VPS Optimize
 
-面向 **Ubuntu / Debian** 的 VPS **综合优化脚本**：官方 BBR、TCP/网络调优、资源限制、SWAP、磁盘与日常维护，交互式菜单一键或分项执行。
+面向 **Ubuntu / Debian VPS 与独立服务器** 的综合优化脚本：官方 BBR、TCP/网络调优、资源限制、SWAP、磁盘与日常维护，交互式菜单一键或分项执行。
 
 > 版本 **2.0** 起：**仅使用内核官方 BBR**（`tcp_bbr`），已移除不可靠/难维护的 **BBRx**；配置写入 drop-in，不再整文件覆盖 `/etc/sysctl.conf`。
 
@@ -26,9 +26,13 @@
 | 8 | 查看状态 | 拥塞控制、缓冲、路由、SWAP 等 |
 | 9 | 卸载还原 | 移除本脚本写入的配置与服务 |
 | 10 | GitHub Hosts | 可选：立即更新并配置每日自动更新 |
+| 11 | APT 换源 | 可选：选择镜像、查看列表、恢复备份 |
 
 **一键全量故意不包含 SSH 改密/关密码**，避免误锁登录；需要时请单独选 **7** 或运行 `key.sh`。
 **GitHub Hosts 也不属于一键全量**，只有选择菜单 **10** 或使用专用参数时才会启用。
+**APT 换源也不属于一键全量**，只有选择菜单 **11** 或使用专用参数时才会启动。
+
+定时清理优先复用正在运行且开机启用的 cron。若缺少 `crontab` 命令或 cron 服务不可用，且系统运行 systemd，则改用 `nanami-clean.timer`，仍在服务器本地时间每日 03:00 执行。`--uninstall` 会移除本脚本创建的 cron 条目或 timer；两种调度器都不可用时会明确报错。若缺少 `crontab` 命令但检测到旧版 root crontab 条目，脚本会停止切换并提示修复，避免重复清理。
 
 ---
 
@@ -63,6 +67,11 @@ sudo bash nanami_optimize_universal.sh --github-hosts
 sudo bash nanami_optimize_universal.sh --github-hosts-update
 sudo bash nanami_optimize_universal.sh --github-hosts-disable -y
 
+# APT 换源（交互选择）、查看镜像、恢复最近一次备份
+sudo bash nanami_optimize_universal.sh --apt-sources
+sudo bash nanami_optimize_universal.sh --apt-sources-list
+sudo bash nanami_optimize_universal.sh --apt-sources-restore
+
 # 查看状态 / 卸载
 sudo bash nanami_optimize_universal.sh --status
 sudo bash nanami_optimize_universal.sh --uninstall
@@ -76,6 +85,7 @@ sudo bash nanami_optimize_universal.sh --uninstall
 | `--status` / `--uninstall` | 状态 / 卸载 |
 | `--github-hosts` / `--github-hosts-update` / `--github-hosts-disable -y` | 启用每日更新 / 立即更新 / 停用并移除本脚本条目 |
 | `--github-hosts-status` | 仅查看 GitHub Hosts 状态 |
+| `--apt-sources` / `--apt-sources-list` / `--apt-sources-restore` | APT 换源菜单 / 镜像列表 / 恢复最近一次源备份 |
 | `-y` / `--yes` | 确认默认 yes |
 | `--bandwidth <Mbps>` | 带宽（配合 `--all` / `--bbr`） |
 | `--region asia\|overseas` | 亚太 / 美欧（影响缓冲大小） |
@@ -90,7 +100,15 @@ sudo bash nanami_optimize_universal.sh --uninstall
 
 `--github-hosts-update` 只更新一次，不开启定时任务。菜单 **10 → 3** 或 `--github-hosts-disable -y` 会移除定时任务和本脚本管理的区块；`--uninstall` 也会移除它们。自动更新记录在 `/var/log/nanami-optimize/github-hosts.log`。
 
-推送到 `main` 或提交 Pull Request 时，CI 会检查 Bash 语法并运行 Hosts 隔离测试。
+推送到 `main` 或提交 Pull Request 时，CI 会检查 Bash 语法，运行 Hosts、APT 入口、物理机调优与卸载恢复隔离测试，并在 Debian 和 Ubuntu 容器中运行定时清理 smoke test。
+
+---
+
+## APT 换源（可选）
+
+菜单 **11** 或 `--apt-sources` 会启动固定在 `a094549` 版本的 [change-apt-src.sh](https://github.com/yayitinyu/apt)。脚本下载后先校验 SHA-256，再运行；需要 `curl` 或 `wget`。该工具会识别 Debian/Ubuntu 版本与架构，支持官方源、国内/地区镜像、自定义 URL，以及 DEB822 格式。更换前需要手动确认，原配置保存在 `/var/backups/apt-src/`；`apt-get update` 失败时会尝试自动恢复。
+
+`--apt-sources-list` 只列出可用源；`--apt-sources-restore` 会在确认后恢复最近一次备份。换源只处理系统 APT 源，其他第三方源（例如 Docker）不会作为镜像目标。`--uninstall` 不恢复 APT 源，请使用独立的恢复入口。
 
 ---
 
@@ -132,11 +150,11 @@ sudo reboot
 | TCP 缓冲 | 按 **带宽 × 地区 RTT（BDP）** 估算 `rmem`/`wmem`，并按内存封顶防 OOM |
 | 吞吐行为 | `tcp_slow_start_after_idle=0`、`tcp_mtu_probing=1`、`tcp_fastopen=3` |
 | 延迟相关 | `tcp_notsent_lowat`、合理 `fin_timeout` / keepalive |
-| 队列 | `tc qdisc … fq`，开机服务 `nanami-boot-apply` 恢复 |
+| 队列 | 仅在默认出口网卡尚未使用 `fq` 时设置，开机服务 `nanami-boot-apply` 恢复 |
 | 起步窗口 | 默认路由 `initcwnd/initrwnd=32`（偏稳妥） |
 | 分片 | iptables `TCPMSS --clamp-mss-to-pmtu` |
-| 网卡 | `txqueuelen`；物理机尝试 ring；虚拟机可关 TSO/GSO/GRO |
-| 安全基线 | 关闭 accept/send redirects、开启 rp_filter 等（非路由场景） |
+| 网卡 | `txqueuelen`；物理机仅在 ring 低于目标且硬件支持时增大；虚拟机可关 TSO/GSO/GRO |
+| 安全基线 | 关闭 accept/send redirects；按 IPv4 转发状态选择 strict 或 loose `rp_filter` |
 
 配置主文件：
 
@@ -155,11 +173,13 @@ sudo reboot
 | 环境 | 支持情况 |
 |------|----------|
 | Ubuntu / Debian + KVM/ Xen 等完整虚拟化 | **推荐** |
-| 物理机 | 支持（网卡 ring 调优更有意义） |
+| 物理机 | 支持；检测已有队列与网卡 ring 配置，避免重复重设 |
 | LXC / OpenVZ / 多数容器 | **受限**（内核参数多由宿主机控制） |
 | RHEL 系等 | 未作为一等公民；部分 apt 逻辑不适用 |
 
 建议内存 **≥ 512MB**；更小内存会自动压低 TCP 缓冲与 dirty 写回阈值。
+
+运行 Docker 或其他转发服务时，网络配置会将 `rp_filter` 设为 loose 模式；未启用 IPv4 转发时使用 strict 模式。新版不再强制设置 `vm.overcommit_memory` 或固定较低的 `tcp_max_tw_buckets`。旧版已应用的运行时值需在重启后才会回到系统默认值，或由管理员按自身工作负载调整。
 
 ---
 
@@ -200,7 +220,11 @@ sudo less /var/log/nanami-optimize/run.log
 sudo bash nanami_optimize_universal.sh --uninstall
 ```
 
-注意：`/swapfile` 与 fstab 中的 `noatime` 不会在卸载时强制回滚，需按需手动处理。备份文件常见后缀：`*.nanami.bak`。
+此命令会要求确认；无人值守执行时需显式加 `-y`。
+
+新版安装会在 `/etc/nanami-optimize/` 记录本脚本创建的 `/swapfile`、追加的 fstab SWAP 条目、根分区 fstab 原行与修改后行，以及即时 remount 前的 atime 模式。卸载时先核对记录：仅停用并删除身份仍匹配的 `/swapfile`，只撤销本脚本添加的 fstab 行和 `noatime`，并尽力恢复原运行时 atime 模式。独立的 VM sysctl 文件也只在内容未被改动时移除。重复执行卸载不会再次修改这些配置。
+
+已有的 `/swapfile`、fstab SWAP/noatime 条目和 VM sysctl 文件不会被覆盖。若安装后有人修改了受管理文件或同一 fstab 行，卸载会保留它们及恢复记录、返回错误，待检查后可重试。停用 SWAP 或即时 remount 失败时也会保留相应记录。旧版安装没有归属记录，无法可靠区分脚本和用户的改动，需人工核对；`*.nanami.bak` 仅供参考，不会整文件覆盖当前 fstab。已创建的 `/swapfile` 再次运行时不会自动调整大小，以免丢失可恢复状态。
 
 ---
 
